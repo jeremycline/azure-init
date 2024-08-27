@@ -107,6 +107,8 @@ pub async fn query(
 
     let response = timeout(total_timeout, async {
         loop {
+            let mut rest_timeout = total_timeout;
+
             if let Ok(response) = client
                 .get(url)
                 .headers(headers.clone())
@@ -117,13 +119,26 @@ pub async fn query(
                 let statuscode = response.status();
 
                 if statuscode.is_success() && statuscode == StatusCode::OK {
+                    tracing::info!(
+                        "{}",
+                        format!(
+                            "HTTP response succeeded with status {}",
+                            statuscode
+                        )
+                    );
                     return Ok(response);
                 }
 
                 if !http::RETRY_CODES.contains(&statuscode) {
-                    return response.error_for_status();
+                    return response.error_for_status().map_err(|err| {
+                        tracing::error!(error = ?err, "{}", format!("HTTP response failed immediately due to status {}", statuscode));
+                        err
+                    });
                 }
             }
+
+            rest_timeout = rest_timeout.saturating_sub(Duration::from_secs(http::IMDS_HTTP_TIMEOUT_SEC));
+            tracing::info!("{}", format!("Retrying to get HTTP response in {} sec, remaining timeout {} sec.", retry_interval.as_secs(), rest_timeout.as_secs()));
 
             tokio::time::sleep(retry_interval).await;
         }
