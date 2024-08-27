@@ -203,6 +203,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::time;
+    use tokio_util::sync::CancellationToken;
 
     use crate::http;
 
@@ -278,9 +279,9 @@ mod tests {
 
     // Runs a test around sending via get_goalstate() with a given statuscode.
     async fn run_goalstate_retry(statuscode: &StatusCode) -> bool {
-        const HTTP_TOTAL_TIMEOUT_SEC: u64 = 5 * 60;
-        const HTTP_PERCLIENT_TIMEOUT_SEC: u64 = 30;
-        const HTTP_RETRY_INTERVAL_SEC: u64 = 2;
+        const HTTP_TOTAL_TIMEOUT_SEC: u64 = 5;
+        const HTTP_PERCLIENT_TIMEOUT_SEC: u64 = 5;
+        const HTTP_RETRY_INTERVAL_SEC: u64 = 1;
 
         let mut default_headers = header::HeaderMap::new();
         let user_agent =
@@ -298,26 +299,18 @@ mod tests {
             TcpListener::bind("127.0.0.1:0").await.unwrap();
         let health_addr = health_serverlistener.local_addr().unwrap();
 
-        tokio::spawn(async move {
-            let (mut serverstream, _) =
-                gs_serverlistener.accept().await.unwrap();
-            serverstream
-                .write_all(gs_ok_payload.as_bytes())
-                .await
-                .unwrap();
+        let cancel_token = tokio_util::sync::CancellationToken::new();
 
-            let (mut serverstream, _) =
-                health_serverlistener.accept().await.unwrap();
-            serverstream
-                .write_all(health_ok_payload.as_bytes())
-                .await
-                .unwrap();
-        });
-
-        // Advance time to 5 minutes later, to prevent tests from being blocked
-        // for long time when retrying on RETRY_CODES.
-        time::pause();
-        time::advance(Duration::from_secs(HTTP_TOTAL_TIMEOUT_SEC)).await;
+        let goalstate_server = tokio::spawn(serve_requests(
+            gs_serverlistener,
+            gs_ok_payload,
+            cancel_token.clone(),
+        ));
+        let health_server = tokio::spawn(serve_requests(
+            health_serverlistener,
+            health_ok_payload,
+            cancel_token.clone(),
+        ));
 
         default_headers.insert(header::USER_AGENT, user_agent);
         let client = Client::builder()
@@ -338,7 +331,18 @@ mod tests {
         .await;
 
         if !vm_goalstate.is_ok() {
-            time::resume();
+            cancel_token.cancel();
+            let health_requests = health_server.await.unwrap();
+            let gs_requests = goalstate_server.await.unwrap();
+            if http::HARDFAIL_CODES.contains(statuscode) {
+                assert_eq!(gs_requests, 1);
+                assert_eq!(health_requests, 0);
+            }
+            if http::RETRY_CODES.contains(statuscode) {
+                assert!(gs_requests >= 4);
+                assert_eq!(health_requests, 0);
+            }
+
             return false;
         }
 
@@ -358,9 +362,33 @@ mod tests {
         )
         .await;
 
-        time::resume();
-
         res_health.is_ok()
+    }
+
+    // Accept incoming connections until the cancellation token is used, then return the count
+    // of accepted connections.
+    async fn serve_requests(
+        listener: TcpListener,
+        payload: String,
+        cancel_token: CancellationToken,
+    ) -> u32 {
+        let mut request_count = 0;
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    break;
+                }
+                _ = async {
+                    let (mut serverstream, _) = listener.accept().await.unwrap();
+                    serverstream.write_all(payload.as_bytes()).await.unwrap();
+                } => {
+                    request_count += 1;
+                }
+            }
+        }
+
+        request_count
     }
 
     #[tokio::test]
